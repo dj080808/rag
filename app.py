@@ -11,6 +11,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct, ScoredPoint,
     Filter, FieldCondition, MatchAny, MatchText, PayloadSchemaType,
+    SparseVector, SparseVectorParams,
 )
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_community.chat_models import ChatTongyi
@@ -37,12 +38,29 @@ def init_core_services():
 
 qdrant_client, embeddings, llm = init_core_services()
 
-# 初始化 Qdrant 集合：显式对齐通义千问嵌入模型的 1024 维度
-if not qdrant_client.collection_exists(collection_name=COLLECTION_NAME):
+# 初始化 Qdrant 集合：命名向量 (dense 语义 + sparse 词法) 支持 RRF 混合检索
+COLLECTION_EXISTS = qdrant_client.collection_exists(collection_name=COLLECTION_NAME)
+NEEDS_MIGRATION = False
+
+if not COLLECTION_EXISTS:
     qdrant_client.create_collection(
         collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=1024, distance=Distance.COSINE),
+        vectors_config={
+            "dense": VectorParams(size=1024, distance=Distance.COSINE),
+        },
+        sparse_vectors_config={
+            "sparse": SparseVectorParams(),
+        },
     )
+else:
+    # 检查旧集合是否需要迁移（无 named vectors）
+    try:
+        info = qdrant_client.get_collection(collection_name=COLLECTION_NAME)
+        has_sparse = hasattr(info.config.params, "sparse_vectors") and info.config.params.sparse_vectors
+        if not has_sparse:
+            NEEDS_MIGRATION = True
+    except Exception:
+        pass
 
 # 为 tags 字段创建 payload 索引，使标签过滤从 O(n) 降为 O(log n)
 try:
@@ -192,9 +210,151 @@ def rerank_with_llm(
     except Exception:
         return candidates[:top_n]
 
+# --- 稀疏向量生成器（n-gram，纯 Python 无额外依赖） ---
+# 用于 RRF 混合检索中的关键词/词法匹配通道
+NGRAM_VOCAB_SIZE = 10000  # 哈希桶数量
+
+def _ngrams(text: str, n: int) -> List[str]:
+    """生成文本的字符级 n-gram（适配中英文混合）"""
+    # 在文本前后加边界标记，让首尾字符也能形成 n-gram
+    text = "^" + text + "$"
+    return [text[i:i+n] for i in range(len(text) - n + 1)]
+
+def text_to_sparse_vector(text: str) -> SparseVector:
+    """
+    将文本转为稀疏向量（TF-IDF 风格的 n-gram 加权）。
+    同时捕获中文字符 n-gram 和英文单词片段，支持混合检索。
+    """
+    # 生成 1-gram / 2-gram / 3-gram
+    all_ngrams = _ngrams(text, 1) + _ngrams(text, 2) + _ngrams(text, 3)
+
+    # 统计频率
+    freq: dict[int, float] = {}
+    for ng in all_ngrams:
+        idx = abs(hash(ng)) % NGRAM_VOCAB_SIZE
+        freq[idx] = freq.get(idx, 0.0) + 1.0
+
+    # 简单 IDF 抑制：高频 n-gram（如纯空格、常见字符）降权
+    max_freq = max(freq.values()) if freq else 1.0
+    indices = []
+    values = []
+    for idx, count in freq.items():
+        # sublinear TF scaling: 1 + log(tf)，抑制高频噪音
+        tf = 1.0 + (count / max_freq) ** 0.5
+        indices.append(idx)
+        values.append(round(tf, 4))
+
+    return SparseVector(indices=indices, values=values)
+
+def text_to_sparse_vector_dict(text: str) -> dict:
+    """同上，但返回 dict 格式（用于 Qdrant PointStruct 的 named vector）"""
+    sv = text_to_sparse_vector(text)
+    return {"indices": sv.indices, "values": sv.values}
+
+# --- Python 端 RRF (Reciprocal Rank Fusion) ---
+# Qdrant 1.18 server 不支持 native Fusion.RRF，在客户端实现 RRF 合并
+RRF_K = 60  # RRF 平滑常数
+
+def rrf_fuse(
+    dense_results: List[ScoredPoint],
+    sparse_results: List[ScoredPoint],
+    top_k: int = 10,
+) -> List[ScoredPoint]:
+    """
+    将稠密向量和稀疏向量的搜索结果用 RRF 公式融合：
+    RRF_score(d) = sum_over_channels( 1 / (k + rank_i(d)) )
+    """
+    rrf_scores: dict[str, float] = {}
+    point_map: dict[str, ScoredPoint] = {}
+
+    # 稠密通道
+    for rank, point in enumerate(dense_results):
+        pid = point.id
+        rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (RRF_K + rank + 1)
+        if pid not in point_map:
+            point_map[pid] = point
+
+    # 稀疏通道
+    for rank, point in enumerate(sparse_results):
+        pid = point.id
+        rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (RRF_K + rank + 1)
+        if pid not in point_map:
+            point_map[pid] = point
+
+    # 按 RRF 分数排序
+    sorted_ids = sorted(rrf_scores.keys(), key=lambda pid: rrf_scores[pid], reverse=True)
+    fused = []
+    for pid in sorted_ids[:top_k]:
+        p = point_map[pid]
+        # 用 RRF 分数替换原始分数
+        p.score = rrf_scores[pid]
+        fused.append(p)
+    return fused
+
+# --- HyDE: 假设文档嵌入，弥合口语查询与技术文档的语义鸿沟 ---
+def generate_hypothetical_doc(query: str) -> str:
+    """
+    让 LLM"脑补"一段假设的排障记录，用技术语言描述用户问题。
+    然后用这段假设文档的 embedding 去检索，比直接用口语查询更精准。
+    """
+    if not query or len(query) < 5:
+        return query
+
+    hyde_prompt = (
+        "你是一个资深运维专家。请根据用户的问题，撰写一段假设的故障排障记录摘要，"
+        "包含：标题、故障现象、关键报错类名/错误码、根本原因。"
+        "使用专业术语，150 字以内，不要编号或列表格式。"
+        f"\n\n用户问题: {query}\n\n假设的排障记录:"
+    )
+
+    try:
+        result = llm.invoke(hyde_prompt)
+        hypothetical = result.content.strip()
+        if not hypothetical or len(hypothetical) < 10:
+            return query
+        return hypothetical
+    except Exception:
+        return query
+
 # ==========================================
 # 4. 后端核心逻辑层
 # ==========================================
+
+def rewrite_query_with_history(chat_history: List[dict], current_query: str) -> str:
+    """
+    上下文感知查询改写：将对话历史中的关键信息融入当前查询，
+    使向量检索能利用上下文消歧/补全。
+    例如: 历史 "Redis 超时" + 当前 "ChannelHandler 那个" → "Redis ChannelHandler 超时"
+    """
+    if not chat_history or len(chat_history) < 2:
+        return current_query
+
+    # 取最近 6 轮对话作为上下文
+    recent = chat_history[-6:]
+    history_text = "\n".join(
+        f"{'用户' if m['role'] == 'user' else '助手'}: {m['content'][:300]}"
+        for m in recent
+    )
+
+    rewrite_prompt = (
+        "你是一个查询改写专家。根据对话历史，将用户的当前问题改写为一个独立、完整、"
+        "包含上下文中关键技术细节的检索查询。保留所有错误码、类名、关键报错信息。"
+        "直接输出改写后的查询，不要加任何前缀或解释。\n\n"
+        f"对话历史:\n{history_text}\n\n"
+        f"当前用户问题: {current_query}\n\n"
+        "改写后的检索查询:"
+    )
+
+    try:
+        result = llm.invoke(rewrite_prompt)
+        rewritten = result.content.strip()
+        # 防御：如果 LLM 返回空或过长，用原文
+        if not rewritten or len(rewritten) > 500:
+            return current_query
+        return rewritten
+    except Exception:
+        return current_query
+
 def search_knowledge_base_logic(
     query: str,
     top_k: int = 5,
@@ -202,13 +362,12 @@ def search_knowledge_base_logic(
     use_tag_filter: bool = True,
     use_expansion: bool = False,
     use_rerank: bool = True,
+    use_rrf: bool = True,
 ) -> tuple[str, dict]:
     """
-    增强版语义检索：
-    - 分数阈值过滤低质量结果
-    - 标签感知过滤（先过滤 → 不够则回退全局）
-    - 错误码关键词加权
-    - 可选查询扩展 + LLM 重排序
+    RRF 混合检索：
+    - 稠密向量 (语义) + 稀疏向量 (词法/n-gram) → RRF 融合
+    - 分数阈值 + 标签感知过滤 + 查询扩展 + LLM 重排序
     返回 (formatted_text, diagnostics_dict)
     """
     diagnostics = {
@@ -223,6 +382,8 @@ def search_knowledge_base_logic(
         "fell_back": False,
         "rerank_applied": False,
         "expansion_applied": False,
+        "rrf_enabled": use_rrf and not NEEDS_MIGRATION,
+        "needs_migration": NEEDS_MIGRATION,
     }
 
     # 1. 查询扩展（可选）
@@ -242,96 +403,171 @@ def search_knowledge_base_logic(
     # 3. 错误码 / 关键词提取（用于 should 加权）
     error_keywords = extract_error_patterns(query)
 
-    # 4. 多查询搜索 + 去重融合
-    all_points: dict[str, ScoredPoint] = {}
+    # 4. 构建 query_filter
+    def _is_full_class_name(kw: str) -> bool:
+        """判断是否完整类名/异常名（如 io.lettuce.core.RedisChannelHandler）"""
+        return bool(re.match(r'^[a-zA-Z][\w]*(\.[\w]+)+[A-Z]\w*$', kw))
 
-    for variant in query_variants:
-        query_vector = cached_embed_query(variant)
-
-        # 构建 query_filter
-        query_filter = None
+    def build_filter(tags: List[str], keywords: List[str]):
+        must_conditions = []
         should_conditions = []
 
-        # should: 关键词加权
-        for kw in error_keywords:
-            should_conditions.append(
-                FieldCondition(key="error_code", match=MatchText(text=kw))
-            )
-            should_conditions.append(
-                FieldCondition(key="description", match=MatchText(text=kw))
+        for kw in keywords:
+            if _is_full_class_name(kw):
+                # 完整类名 → must: 精确匹配错误码字段
+                must_conditions.append(
+                    FieldCondition(key="error_code", match=MatchText(text=kw))
+                )
+            else:
+                # 普通关键词 → should: 加权匹配
+                should_conditions.append(
+                    FieldCondition(key="error_code", match=MatchText(text=kw))
+                )
+                should_conditions.append(
+                    FieldCondition(key="description", match=MatchText(text=kw))
+                )
+
+        # 合并标签条件
+        if tags:
+            must_conditions.append(
+                FieldCondition(key="tags", match=MatchAny(any=tags))
             )
 
-        if query_tags and use_tag_filter:
+        if must_conditions or should_conditions:
             try:
-                query_filter = Filter(
-                    must=[
-                        FieldCondition(
-                            key="tags",
-                            match=MatchAny(any=query_tags),
-                        )
-                    ],
+                return Filter(
+                    must=must_conditions if must_conditions else None,
                     should=should_conditions if should_conditions else None,
                 )
-                diagnostics["filter_applied"] = True
             except Exception:
-                query_filter = (
-                    Filter(should=should_conditions) if should_conditions else None
+                return Filter(should=should_conditions) if should_conditions else None
+        return None
+
+    query_filter = build_filter(query_tags, error_keywords)
+    if query_filter and query_tags:
+        diagnostics["filter_applied"] = True
+
+    # 5. RRF 混合检索：稠密 + 稀疏 → Python 端 RRF 融合
+    all_points: dict[str, ScoredPoint] = {}
+    rrf_enabled = diagnostics["rrf_enabled"]
+
+    for variant in query_variants:
+        dense_vector = cached_embed_query(variant)
+        sparse_vector = text_to_sparse_vector(variant)
+
+        try:
+            if rrf_enabled:
+                # ─── RRF: 分别做 dense + sparse 搜索，再客户端融合 ───
+                dense_resp = qdrant_client.query_points(
+                    collection_name=COLLECTION_NAME,
+                    query=dense_vector,
+                    using="dense",
+                    query_filter=query_filter,
+                    limit=top_k * 3 if use_rerank else top_k,
+                    score_threshold=score_threshold,
                 )
-        elif should_conditions:
-            query_filter = Filter(should=should_conditions)
+                dense_points = dense_resp.points if dense_resp else []
 
-        # 执行向量检索
-        try:
-            response = qdrant_client.query_points(
-                collection_name=COLLECTION_NAME,
-                query=query_vector,
-                query_filter=query_filter,
-                limit=top_k * 3 if use_rerank else top_k,
-                score_threshold=score_threshold,
-            )
-        except Exception:
-            # 过滤语法不兼容时回退到无过滤搜索
-            response = qdrant_client.query_points(
-                collection_name=COLLECTION_NAME,
-                query=query_vector,
-                limit=top_k * 3 if use_rerank else top_k,
-                score_threshold=score_threshold,
-            )
+                sparse_resp = qdrant_client.query_points(
+                    collection_name=COLLECTION_NAME,
+                    query=sparse_vector,
+                    using="sparse",
+                    query_filter=query_filter,
+                    limit=top_k * 3 if use_rerank else top_k,
+                    score_threshold=0.0,  # 稀疏分数范围不同，阈值在 RRF 后统一处理
+                )
+                sparse_points = sparse_resp.points if sparse_resp else []
 
-        if response and response.points:
-            for point in response.points:
-                pid = point.id
-                if pid not in all_points or point.score > all_points[pid].score:
-                    all_points[pid] = point
-
-    # 5. 标签过滤回退：结果太少则去掉过滤再搜一次
-    if diagnostics["filter_applied"] and len(all_points) < 2:
-        diagnostics["fell_back"] = True
-        query_vector = cached_embed_query(query)
-        try:
-            response = qdrant_client.query_points(
-                collection_name=COLLECTION_NAME,
-                query=query_vector,
-                limit=top_k * 3 if use_rerank else top_k,
-                score_threshold=score_threshold,
-            )
-            if response and response.points:
-                for point in response.points:
+                fused = rrf_fuse(dense_points, sparse_points, top_k=top_k * 3 if use_rerank else top_k)
+                for point in fused:
                     pid = point.id
                     if pid not in all_points or point.score > all_points[pid].score:
                         all_points[pid] = point
+            else:
+                # 回退：仅稠密向量
+                response = qdrant_client.query_points(
+                    collection_name=COLLECTION_NAME,
+                    query=dense_vector,
+                    using="dense",
+                    query_filter=query_filter,
+                    limit=top_k * 3 if use_rerank else top_k,
+                    score_threshold=score_threshold,
+                )
+                if response and response.points:
+                    for point in response.points:
+                        pid = point.id
+                        if pid not in all_points or point.score > all_points[pid].score:
+                            all_points[pid] = point
+        except Exception:
+            # 过滤语法不兼容 / sparse 不可用 → 回退 dense-only
+            try:
+                response = qdrant_client.query_points(
+                    collection_name=COLLECTION_NAME,
+                    query=dense_vector,
+                    using="dense",
+                    limit=top_k * 3 if use_rerank else top_k,
+                    score_threshold=score_threshold,
+                )
+                if response and response.points:
+                    for point in response.points:
+                        pid = point.id
+                        if pid not in all_points or point.score > all_points[pid].score:
+                            all_points[pid] = point
+            except Exception:
+                continue
+
+    # 6. 标签过滤回退：结果太少则去掉过滤再搜一次
+    if diagnostics["filter_applied"] and len(all_points) < 2:
+        diagnostics["fell_back"] = True
+        unfiltered_filter = build_filter([], error_keywords)
+        dense_vector = cached_embed_query(query)
+        sparse_vector = text_to_sparse_vector(query)
+
+        try:
+            if rrf_enabled:
+                dense_resp = qdrant_client.query_points(
+                    collection_name=COLLECTION_NAME,
+                    query=dense_vector, using="dense", query_filter=unfiltered_filter,
+                    limit=top_k * 3 if use_rerank else top_k,
+                    score_threshold=score_threshold,
+                )
+                sparse_resp = qdrant_client.query_points(
+                    collection_name=COLLECTION_NAME,
+                    query=sparse_vector, using="sparse", query_filter=unfiltered_filter,
+                    limit=top_k * 3 if use_rerank else top_k,
+                    score_threshold=0.0,
+                )
+                fallback_fused = rrf_fuse(
+                    dense_resp.points if dense_resp else [],
+                    sparse_resp.points if sparse_resp else [],
+                    top_k=top_k * 3 if use_rerank else top_k,
+                )
+                for point in fallback_fused:
+                    pid = point.id
+                    if pid not in all_points or point.score > all_points[pid].score:
+                        all_points[pid] = point
+            else:
+                response = qdrant_client.query_points(
+                    collection_name=COLLECTION_NAME,
+                    query=dense_vector, using="dense", query_filter=unfiltered_filter,
+                    limit=top_k * 3 if use_rerank else top_k,
+                    score_threshold=score_threshold,
+                )
+                if response and response.points:
+                    for point in response.points:
+                        pid = point.id
+                        if pid not in all_points or point.score > all_points[pid].score:
+                            all_points[pid] = point
         except Exception:
             pass
 
-    candidates = sorted(
-        all_points.values(), key=lambda p: p.score, reverse=True
-    )
+    candidates = sorted(all_points.values(), key=lambda p: p.score, reverse=True)
     diagnostics["candidates_raw"] = len(candidates)
 
     if not candidates:
         return "知识库中未找到相关排障记录。", diagnostics
 
-    # 6. LLM 重排序（可选）
+    # 7. LLM 重排序（可选）
     if use_rerank and len(candidates) > top_k:
         diagnostics["rerank_applied"] = True
         candidates = rerank_with_llm(query, candidates, top_n=top_k)
@@ -340,7 +576,7 @@ def search_knowledge_base_logic(
     diagnostics["top_score"] = round(candidates[0].score, 4) if candidates else 0.0
     diagnostics["min_score"] = round(candidates[-1].score, 4) if candidates else 0.0
 
-    # 7. 格式化结果（含相似度分数）
+    # 8. 格式化结果（含相似度分数）
     formatted_results = []
     for hit in candidates:
         p = hit.payload
@@ -417,21 +653,40 @@ def smart_record_logic(title: str, pronto_id: str, description: str, root_cause:
     }
     
     # 3. 生成高维特征向量：
-    # 【关键点】我们【只拿脱水后的干净文本】去计算向量，彻底避免向量均值化和失焦
+    # 【关键点】只拿脱水后的干净文本计算向量，dense + sparse 双通道
     text_to_vector = f"标题: {title} 现象摘要: {clean_desc} 原因摘要: {clean_cause} 核心报错: {error_code} 解决方案: {solution}"
-    vector = cached_embed_query(text_to_vector)
-    
+    dense_vector = cached_embed_query(text_to_vector)
+
     # 4. 持久化存入 Qdrant
-    qdrant_client.upsert(
-        collection_name=COLLECTION_NAME,
-        points=[
-            PointStruct(
-                id=str(uuid.uuid4()),
-                vector=vector,
-                payload=final_payload
-            )
-        ]
-    )
+    new_id = str(uuid.uuid4())
+    if NEEDS_MIGRATION:
+        # 旧集合不支持命名向量，使用旧格式（仅 dense）
+        qdrant_client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[
+                PointStruct(
+                    id=new_id,
+                    vector=dense_vector,
+                    payload=final_payload,
+                )
+            ]
+        )
+    else:
+        # 新集合：命名向量 (dense 语义 + sparse 词法) — 支持 RRF 混合检索
+        sparse_vector = text_to_sparse_vector_dict(text_to_vector)
+        qdrant_client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[
+                PointStruct(
+                    id=new_id,
+                    vector={
+                        "dense": dense_vector,
+                        "sparse": sparse_vector,
+                    },
+                    payload=final_payload
+                )
+            ]
+        )
     return final_payload
 
 # ==========================================
@@ -463,6 +718,41 @@ st.caption("基于 Qwen-Plus 与 Qdrant 向量数据库，由你掌控核心资�
 # 侧边栏导航控制
 page = st.sidebar.radio("功能导航", ["🔍 故障智能检索", "✍️ 维护日志智能录入"])
 
+# 侧边栏：检索模式
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 💬 检索模式")
+
+# 会话状态初始化
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []  # {role, content, diagnostics, msg_id}
+if "search_mode" not in st.session_state:
+    st.session_state.search_mode = "上下文连续检索"
+if "feedback" not in st.session_state:
+    st.session_state.feedback = {}  # msg_id → "relevant" | "irrelevant"
+if "msg_counter" not in st.session_state:
+    st.session_state.msg_counter = 0  # 用于生成唯一消息 ID
+
+search_mode = st.sidebar.radio(
+    "检索模式",
+    ["上下文连续检索", "全新独立检索"],
+    help="**上下文连续检索**：将历史对话代入，每次检索叠加上下文，逐步逼近目标。\n\n"
+         "**全新独立检索**：每次检索独立进行，不携带历史上下文。"
+)
+
+# 模式切换时清空历史
+if search_mode != st.session_state.search_mode:
+    st.session_state.search_mode = search_mode
+    st.session_state.chat_history = []
+
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    if st.button("🗑️ 清空对话", use_container_width=True):
+        st.session_state.chat_history = []
+        st.rerun()
+with col2:
+    history_len = len(st.session_state.chat_history)
+    st.caption(f"已积累 {history_len} 条消息")
+
 # 侧边栏检索参数
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ⚙️ 检索参数")
@@ -476,9 +766,17 @@ retrieval_score_threshold = st.sidebar.slider(
 )
 
 with st.sidebar.expander("🔧 高级检索选项"):
+    use_rrf = st.checkbox(
+        "启用 RRF 混合检索", value=True,
+        help="稠密向量 (语义) + 稀疏向量 (词法) → RRF 融合，显著提升精确率"
+    )
     use_tag_filter = st.checkbox(
         "启用标签过滤", value=True,
         help="从查询中提取技术标签，仅搜索匹配标签的案例（结果太少时自动回退）"
+    )
+    use_hyde = st.checkbox(
+        "启用 HyDE 假设文档", value=False,
+        help="让 LLM 先生成一段假设排障记录，再用它去检索（+1 LLM 调用，显著提升口语查询精确率）"
     )
     use_query_expansion = st.checkbox(
         "启用查询扩展", value=False,
@@ -493,109 +791,222 @@ with st.sidebar.expander("🔧 高级检索选项"):
         help="展示检索过程的详细诊断信息"
     )
 
-# ---- 功能展示区：故障智能检索（流式输出版） ----
+# 集合迁移提示与一键升级
+if NEEDS_MIGRATION:
+    st.sidebar.warning(
+        "⚠️ 当前知识库格式较旧，不支持 RRF 混合检索。"
+        "新录入的案例将自动使用旧格式（仅 dense）。"
+    )
+    if st.sidebar.button("🔄 一键迁移到 RRF 双向量格式", type="secondary",
+                         help="删除旧集合并创建支持 dense+sparse 的新集合（已有数据将丢失，请先备份）"):
+        try:
+            qdrant_client.delete_collection(collection_name=COLLECTION_NAME)
+            qdrant_client.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config={
+                    "dense": VectorParams(size=1024, distance=Distance.COSINE),
+                },
+                sparse_vectors_config={
+                    "sparse": SparseVectorParams(),
+                },
+            )
+            # 重建 tags 索引
+            qdrant_client.create_payload_index(
+                collection_name=COLLECTION_NAME,
+                field_name="tags",
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+            NEEDS_MIGRATION = False
+            st.sidebar.success("✅ 迁移完成！现支持 RRF 混合检索（dense + sparse）。")
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"迁移失败: {e}")
+
+# ---- 功能展示区：故障智能检索（对话式） ----
 if page == "🔍 故障智能检索":
     st.header("智能故障诊断与检索")
-    st.markdown("支持**模糊现象提问、查历史故障库**。你也可以直接对它说：*“帮我查查刚刚日志里有什么报错，顺便看看以前有人解决过没。”*")
 
-    user_input = st.text_input("输入当前遇到的问题或操作指令:",
-                               placeholder="例如：帮我看看刚才日志里的超时错，顺便看看怎么搞")
+    is_contextual = (search_mode == "上下文连续检索")
 
-    if st.button("开始诊断分析", type="primary"):
-        if user_input.strip() == "":
-            st.warning("请先输入一些内容吧！")
-        else:
-            # 1. 静态前置处理（查日志、查数据库都需要时间，我们用 st.spinner 包裹）
-            with st.spinner("Agent 正在搜集线索并检索向量数据库..."):
-                # 注册日志查看工具，并先让大模型进行意图路由判断
-                llm_with_tools = llm.bind_tools([fetch_live_error_log])
-                intent_check = llm_with_tools.invoke([
-                    ("system", "你是一个运维 Agent。请判断用户是否需要查看当下的实时日志。如果是，请立即调用 fetch_live_error_log 工具。"),
-                    ("human", user_input)
-                ])
+    if is_contextual:
+        st.markdown(
+            "**🔄 上下文连续检索模式** — 每次检索携带历史对话，逐步逼近目标。"
+            "输入追加信息即可细化查询。"
+        )
+    else:
+        st.markdown(
+            "**🆕 全新独立检索模式** — 每次检索彼此独立，不携带任何历史上下文。"
+        )
 
-                live_log_context = ""
-                if intent_check.tool_calls:
-                    for tool_call in intent_check.tool_calls:
-                        if tool_call["name"] == "fetch_live_error_log":
-                            st.caption("🤖 **Agent 动作**：检测到需要查看实时日志，正在读取本地 `error.log`...")
-                            live_log_context = fetch_live_error_log.invoke(tool_call["args"])
-                            with st.chat_message("assistant"):
-                                st.text(live_log_context)
+    # 渲染历史消息
+    for idx, msg in enumerate(st.session_state.chat_history):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-                # 根据获取的上下文去查向量数据库
-                search_query = live_log_context if live_log_context else user_input
-                st.caption("🤖 **Agent 动作**：正在对线索进行高维特征转换，检索 Qdrant 知识库...")
+            # 反馈按钮（仅对助手消息）
+            if msg["role"] == "assistant" and msg.get("msg_id"):
+                mid = msg["msg_id"]
+                current_feedback = st.session_state.feedback.get(mid)
+                fc1, fc2, fc_space = st.columns([1, 1, 15])
+                with fc1:
+                    if st.button("👍", key=f"rel_{mid}",
+                                 help="结果相关",
+                                 type="primary" if current_feedback == "relevant" else "secondary"):
+                        st.session_state.feedback[mid] = "relevant"
+                        st.rerun()
+                with fc2:
+                    if st.button("👎", key=f"irrel_{mid}",
+                                 help="结果不相关",
+                                 type="primary" if current_feedback == "irrelevant" else "secondary"):
+                        st.session_state.feedback[mid] = "irrelevant"
+                        st.rerun()
+                if current_feedback:
+                    with fc_space:
+                        st.caption(
+                            "✅ 感谢反馈" if current_feedback == "relevant"
+                            else "📝 已记录，将用于优化"
+                        )
 
-                # 标签过滤提示
-                if use_tag_filter:
-                    query_tags = extract_query_tags(search_query)
-                    if query_tags:
-                        st.caption(f"🏷️ 提取到查询标签: `{', '.join(query_tags)}`")
-
-                tool_output, diagnostics = search_knowledge_base_logic(
-                    query=search_query,
-                    top_k=retrieval_top_k,
-                    score_threshold=retrieval_score_threshold,
-                    use_tag_filter=use_tag_filter,
-                    use_expansion=use_query_expansion,
-                    use_rerank=use_llm_rerank,
-                )
-
-            # 诊断信息展示
-            if show_diagnostics:
-                with st.expander("🔬 检索质量诊断", expanded=False):
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("候选结果数", diagnostics["candidates_raw"])
-                        st.metric("标签过滤", "✓" if diagnostics["filter_applied"] else "✗")
-                    with col2:
-                        st.metric("重排序后", diagnostics["candidates_after_rerank"])
-                        st.metric("已回退", "✓" if diagnostics["fell_back"] else "✗")
-                    with col3:
-                        st.metric("最高匹配度", f"{diagnostics['top_score']:.2%}")
-                        st.metric("最低匹配度", f"{diagnostics['min_score']:.2%}")
-                    st.caption(f"查询标签: `{', '.join(diagnostics['query_tags']) if diagnostics['query_tags'] else '无'}`")
-                    st.caption(f"查询变体数: {diagnostics['variants_used']} | "
-                              f"重排序: {'✓' if diagnostics['rerank_applied'] else '✗'} | "
-                              f"扩展: {'✓' if diagnostics['expansion_applied'] else '✗'}")
-                    st.caption(f"原始查询: {diagnostics['query']}")
-                    st.json(diagnostics)
-
-            # 2. ─── 🚀 【核心优化：严格截断幻觉，查不到直接说不知道】 ───
-            st.subheader("💡 Agent 最终诊断报告：")
-
-            # 检查知识库返回结果是否包含有效数据（通过判断关键字）
-            if "知识库中未找到相关排障记录" in tool_output:
-                with st.chat_message("assistant"):
-                    st.error("❌ 抱歉，当前内部知识库中未检索到任何与该故障相关的相似历史案例。")
-                    st.markdown("**💡 建议行动：** 本系统为严格防御模式，已拦截大模型的公开通识幻觉。请前往相关平台手动排查，或在解决后将该案例录入知识库。")
-            else:
-                # 只有当知识库真正捞出东西时，才允许大模型组织语言
-                with st.chat_message("assistant"):
-
-                    # 设定最高优先级的 System 约束，不允许有任何发散
-                    strict_prompt = (
-                        "你是一个极度严谨的内部运维专家助手。你的回答必须【完全基于】下方提供的【内部故障库参考资料】。\n"
-                        "⚠️ 铁律：\n"
-                        "1. 严格禁止使用你自身对公开网络、开源软件的通用常识来脑补、扩充或捏造解决方案。\n"
-                        "2. 如果参考资料里的方案不完整，请直接基于资料原样陈述，绝对不允许发明任何内部系统的参数、命令或流程。\n"
-                        "3. 必须保持回答的真实性，拒绝任何幻觉。\n\n"
-                        f"用户当前请求: {user_input}\n"
-                        f"当前实时日志线索: {live_log_context if live_log_context else '未提取到实时日志'}\n"
-                        f"【唯一合法的内部故障库参考资料】:\n{tool_output}\n\n"
-                        "请根据上述合法资料，为用户梳理并总结出标准修复建议："
+            if msg.get("diagnostics") and show_diagnostics:
+                with st.expander("🔬 本次检索诊断", expanded=False):
+                    d = msg["diagnostics"]
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.metric("候选数", d.get("candidates_raw", 0))
+                        st.metric("标签过滤", "✓" if d.get("filter_applied") else "✗")
+                    with c2:
+                        st.metric("重排序后", d.get("candidates_after_rerank", 0))
+                        st.metric("已回退", "✓" if d.get("fell_back") else "✗")
+                    with c3:
+                        st.metric("最高匹配度", f"{d.get('top_score', 0):.2%}")
+                        st.metric("最低匹配度", f"{d.get('min_score', 0):.2%}")
+                    st.caption(
+                        f"查询标签: `{', '.join(d.get('query_tags', [])) or '无'}` | "
+                        f"RRF: {'✓' if d.get('rrf_enabled') else '✗'} | "
+                        f"HyDE: {'✓' if d.get('hyde_applied') else '✗'} | "
+                        f"重排序: {'✓' if d.get('rerank_applied') else '✗'}"
                     )
+                    if d.get("rewritten_query"):
+                        st.caption(f"改写后查询: {d['rewritten_query']}")
 
-                    text_placeholder = st.empty()
-                    full_response = ""
+    # 聊天输入
+    user_input = st.chat_input("输入当前遇到的问题或操作指令...",
+                               key="chat_input_key")
 
-                    # 流式渲染
-                    for chunk in llm.stream(strict_prompt):
-                        full_response += chunk.content
-                        text_placeholder.markdown(full_response + "┃")
+    if user_input and user_input.strip():
+        # 新增用户消息（带唯一 ID）
+        st.session_state.msg_counter += 1
+        user_msg_id = f"u{st.session_state.msg_counter}"
+        st.session_state.chat_history.append({
+            "role": "user", "content": user_input, "msg_id": user_msg_id,
+        })
 
-                    text_placeholder.markdown(full_response)
+        with st.spinner("Agent 正在搜集线索并检索向量数据库..."):
+            # 1. 上下文查询改写（仅上下文模式）
+            if is_contextual and len(st.session_state.chat_history) > 1:
+                search_query = rewrite_query_with_history(
+                    st.session_state.chat_history[:-1],
+                    user_input
+                )
+            else:
+                search_query = user_input
+
+            # 1.5 HyDE 假设文档生成（可选）
+            hyde_applied = False
+            if use_hyde:
+                st.caption("🤖 **Agent 动作**：正在生成假设排障文档以提升检索精度...")
+                hyde_doc = generate_hypothetical_doc(search_query)
+                if hyde_doc != search_query:
+                    search_query = hyde_doc
+                    hyde_applied = True
+
+            # 2. 日志意图检测
+            llm_with_tools = llm.bind_tools([fetch_live_error_log])
+            intent_check = llm_with_tools.invoke([
+                ("system", "你是一个运维 Agent。请判断用户是否需要查看当下的实时日志。如果是，请立即调用 fetch_live_error_log 工具。"),
+                ("human", user_input)
+            ])
+
+            live_log_context = ""
+            if intent_check.tool_calls:
+                for tool_call in intent_check.tool_calls:
+                    if tool_call["name"] == "fetch_live_error_log":
+                        live_log_context = fetch_live_error_log.invoke(tool_call["args"])
+                        st.session_state.msg_counter += 1
+                        log_msg = "📋 **实时日志捕获:**\n```\n" + live_log_context + "\n```"
+                        st.session_state.chat_history.append({
+                            "role": "assistant", "content": log_msg,
+                            "diagnostics": None,
+                            "msg_id": f"a{st.session_state.msg_counter}",
+                        })
+
+            final_search_query = live_log_context if live_log_context else search_query
+
+            if use_tag_filter:
+                query_tags = extract_query_tags(final_search_query)
+                if query_tags:
+                    st.caption(f"🏷️ 提取到查询标签: `{', '.join(query_tags)}`")
+
+            # 3. 向量检索
+            tool_output, diagnostics = search_knowledge_base_logic(
+                query=final_search_query,
+                top_k=retrieval_top_k,
+                score_threshold=retrieval_score_threshold,
+                use_tag_filter=use_tag_filter,
+                use_expansion=use_query_expansion,
+                use_rerank=use_llm_rerank,
+                use_rrf=use_rrf,
+            )
+            diagnostics["rewritten_query"] = search_query if search_query != user_input else ""
+            diagnostics["hyde_applied"] = hyde_applied
+
+        # 4. LLM 回答
+        if "知识库中未找到相关排障记录" in tool_output:
+            answer = (
+                "❌ 抱歉，当前内部知识库中未检索到任何与该故障相关的相似历史案例。\n\n"
+                "**💡 建议行动：** 本系统为严格防御模式，已拦截大模型的公开通识幻觉。"
+                "请前往相关平台手动排查，或在解决后将该案例录入知识库。"
+            )
+        else:
+            history_context = ""
+            if is_contextual and len(st.session_state.chat_history) > 1:
+                recent = st.session_state.chat_history[-6:]
+                history_context = "【近期对话历史】\n" + "\n".join(
+                    f"{'用户' if m['role'] == 'user' else '助手'}: {m['content'][:200]}"
+                    for m in recent[:-1]
+                ) + "\n\n"
+
+            strict_prompt = (
+                "你是一个极度严谨的内部运维专家助手。你的回答必须【完全基于】下方提供的【内部故障库参考资料】。\n"
+                "⚠️ 铁律：\n"
+                "1. 严格禁止使用你自身对公开网络、开源软件的通用常识来脑补、扩充或捏造解决方案。\n"
+                "2. 如果参考资料里的方案不完整，请直接基于资料原样陈述，绝对不允许发明任何内部系统的参数、命令或流程。\n"
+                "3. 必须保持回答的真实性，拒绝任何幻觉。\n\n"
+                f"{history_context}"
+                f"用户当前请求: {user_input}\n"
+                f"当前实时日志线索: {live_log_context if live_log_context else '未提取到实时日志'}\n"
+                f"【唯一合法的内部故障库参考资料】:\n{tool_output}\n\n"
+                "请根据上述合法资料，为用户梳理并总结出标准修复建议："
+            )
+
+            answer = ""
+            for chunk in llm.stream(strict_prompt):
+                answer += chunk.content
+
+        # 5. 记录助手回答
+        st.session_state.msg_counter += 1
+        st.session_state.chat_history.append({
+            "role": "assistant",
+            "content": answer,
+            "diagnostics": diagnostics,
+            "msg_id": f"a{st.session_state.msg_counter}",
+        })
+
+        # 6. 全新模式下，只保留最后一轮
+        if not is_contextual:
+            st.session_state.chat_history = st.session_state.chat_history[-2:]
+
+        st.rerun()
 
 # ---- 功能展示区：全新可控结构化录入表单 ----
 elif page == "✍️ 维护日志智能录入":

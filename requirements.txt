@@ -1,0 +1,5 @@
+streamlit>=1.50
+qdrant-client>=1.10
+langchain-community>=0.4
+dashscope>=1.20
+pydantic>=2.0
