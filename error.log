@@ -1,0 +1,4 @@
+2026-05-20 15:30:01 [INFO] System initialized successfully.
+2026-05-20 15:31:45 [WARN] Database pool connection high risk.
+2026-05-20 15:32:12 [ERROR] org.apache.catalina.connector.ClientAbortException: java.io.IOException: Broken pipe
+2026-05-20 15:33:00 [ERROR] io.lettuce.core.RedisChannelHandler - Connection timeout during cluster topology refresh.
